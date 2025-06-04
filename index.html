@@ -1,0 +1,570 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, getDocs, doc, setDoc, addDoc, onSnapshot, query, where } from 'firebase/firestore';
+import { MessageCircle, Zap, Send, Loader2, User, List, AlertTriangle, CheckCircle2, Brain, PlusCircle, Edit3, Sparkles, ArrowRight } from 'lucide-react';
+
+// Firebase config and App ID (these will be provided by the environment)
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// Initialize Firebase
+let app;
+let auth;
+let db;
+
+try {
+    app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+} catch (error) {
+    console.error("Error initializing Firebase:", error);
+    if (!app && !firebaseConfig.apiKey) {
+        console.warn("Firebase config not found. Using placeholder data. App will not connect to Firebase.");
+    }
+}
+
+// Expanded Default scenarios
+const DEFAULT_SCENARIOS = [
+    {
+        id: "cleanup",
+        title: "Child refuses to clean up toys",
+        reactiveResponses: [
+            "If you don't clean up NOW, you're losing screen time!",
+            "You're so lazy! Why do I always have to tell you?",
+            "Fine, live in a pigsty. I don't care."
+        ],
+        modelResponses: [
+            { principle: "Acknowledge Feelings", response: "It looks like you're having so much fun playing, and it's hard to stop. I get it." },
+            { principle: "Describe the Problem", response: "The toys on the floor are making it tricky to walk. Someone might trip." },
+            { principle: "Offer a Choice", response: "Would you like to clean up the blocks first, or the cars? Or maybe we can make it a game?" }
+        ],
+        promptContext: "A child is refusing to clean up their toys. The parent wants to respond mindfully, using principles like acknowledging feelings, describing the problem without blame, and offering choices."
+    },
+    {
+        id: "hatesyou",
+        title: "Child says 'I hate you!'",
+        reactiveResponses: [
+            "Don't you ever say that to me again!",
+            "Well, I hate you too sometimes!",
+            "That's a terrible thing to say. Go to your room."
+        ],
+        modelResponses: [
+            { principle: "Acknowledge Feelings (Underlying)", response: "Wow, you must be feeling really angry to say that. It sounds like something made you very upset." },
+            { principle: "Accept Feelings, Not Behavior", response: "I understand you're feeling very strong emotions right now. It's okay to be angry, but it's not okay to say hurtful things." },
+            { principle: "Invite Discussion", response: "Can you tell me what happened that made you feel this way?" }
+        ],
+        promptContext: "A child has just told their parent 'I hate you!'. The parent wants to respond by acknowledging the strong underlying feelings without reacting defensively, and opening a door for communication."
+    },
+    {
+        id: "siblingfighting",
+        title: "Siblings are fighting over a toy",
+        reactiveResponses: [
+            "Stop it, both of you! If you can't share, no one gets it.",
+            "Who started it? You're always picking on your brother!",
+            "I don't have time for this nonsense."
+        ],
+        modelResponses: [
+            { principle: "Acknowledge Both Sides", response: "It sounds like you both want the same toy, and that's causing a big disagreement. That's tough." },
+            { principle: "Describe the Problem", response: "I hear a lot of yelling and see two unhappy faces. We need to find a way for everyone to feel okay." },
+            { principle: "Encourage Problem-Solving", response: "What are some ideas for how you could solve this? Could you take turns? Could you play with it together?" }
+        ],
+        promptContext: "Two siblings are fighting over a toy. The parent wants to help them resolve the conflict themselves by acknowledging their feelings, stating the problem, and guiding them to find a solution."
+    },
+    {
+        id: "whining",
+        title: "Child is whining or crying about something minor",
+        reactiveResponses: [
+            "Stop whining! It's not a big deal.",
+            "You're acting like a baby.",
+            "I can't understand you when you whine like that."
+        ],
+        modelResponses: [
+            { principle: "Acknowledge the Feeling", response: "You sound really unhappy right now. It seems like [the small thing] is really bothering you." },
+            { principle: "Give it a Name", response: "It's frustrating when [the small thing happens], isn't it?" },
+            { principle: "Offer a Way to Communicate", response: "It's hard for me to understand when you whine. Can you try telling me in your regular voice what's wrong?" }
+        ],
+        promptContext: "A child is whining or crying about something that seems minor to the parent. The parent wants to acknowledge the child's feeling without dismissing it, and encourage clearer communication."
+    },
+    {
+        id: "interrupting",
+        title: "Child keeps interrupting while you're on a call",
+        reactiveResponses: [
+            "Can't you see I'm busy? Go away!",
+            "If you interrupt one more time, you're in big trouble.",
+            "(Ignoring the child completely)"
+        ],
+        modelResponses: [
+            { principle: "Prepare Beforehand (if possible)", response: "(Before call) 'I have an important call now. I need quiet for about [X] minutes. What's one thing you can do while I'm on the call?'" },
+            { principle: "Acknowledge (Briefly, Non-verbally if possible)", response: "A quick smile, a hand gesture for 'one moment'." },
+            { principle: "State the Need Clearly & Kindly", response: "(If interruption persists) 'I need to finish this call. I can help you as soon as I'm done. It will be about [Y] more minutes.'" },
+            { principle: "Problem-Solve Later", response: "(After call) 'It was hard for me to focus on my call when I was being interrupted. What can we do next time so this works better for both of us?'" }
+        ],
+        promptContext: "A child is repeatedly interrupting their parent during an important phone call. The parent needs to manage the interruption effectively while still being respectful to the child."
+    },
+    {
+        id: "homeworkstruggle",
+        title: "Child is frustrated and refusing to do homework",
+        reactiveResponses: [
+            "You have to do it, and that's final!",
+            "Why are you making this so difficult? It's not that hard.",
+            "If you don't finish your homework, you can't [do preferred activity]."
+        ],
+        modelResponses: [
+            { principle: "Acknowledge the Struggle", response: "This homework looks really frustrating. I can see you're feeling stuck." },
+            { principle: "Break it Down", response: "What's one small part we can look at first? Maybe just this one problem?" },
+            { principle: "Offer Support, Not Answers", response: "What do you think the first step might be? I'm here to help you think it through, not do it for you." },
+            { principle: "Emphasize Effort over Outcome", response: "I appreciate how hard you're trying, even when it's tough." }
+        ],
+        promptContext: "A child is expressing frustration and resistance towards doing their homework. The parent wants to encourage them without taking over or escalating the situation."
+    },
+    {
+        id: "bedtimebattle",
+        title: "Child resists bedtime and wants to keep playing",
+        reactiveResponses: [
+            "Bedtime! Now! No arguments!",
+            "You're going to be so tired and grumpy tomorrow if you don't sleep.",
+            "If you get out of bed again, I'm taking away [privilege]."
+        ],
+        modelResponses: [
+            { principle: "Empathize with Desire to Play", response: "I know, it's so much fun to play, and it's hard to stop when you're having a good time." },
+            { principle: "State the Routine/Expectation Calmly", response: "It's bedtime now. Our bodies need rest to grow strong and have energy for tomorrow." },
+            { principle: "Offer Limited, Calming Choices", response: "Would you like to read one story or two short ones? Do you want to wear your blue pajamas or your red ones?" },
+            { principle: "Create a Connection Ritual", response: "Let's have our special cuddle time after you're in bed." }
+        ],
+        promptContext: "A child is resisting going to bed, wanting to continue playing or stay up longer. The parent aims to make bedtime smoother and more connected."
+    }
+];
+
+const App = () => {
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [scenarios, setScenarios] = useState([]);
+    const [selectedScenario, setSelectedScenario] = useState(null);
+    const [userResponse, setUserResponse] = useState('');
+    const [aiFeedback, setAiFeedback] = useState('');
+    const [isLoadingAiFeedback, setIsLoadingAiFeedback] = useState(false);
+    const [error, setError] = useState('');
+    const [showInstructions, setShowInstructions] = useState(true);
+    
+    const [isCustomScenarioMode, setIsCustomScenarioMode] = useState(false);
+    const [customScenarioInput, setCustomScenarioInput] = useState('');
+
+    // Firebase Authentication
+    useEffect(() => {
+        if (!auth) {
+            console.warn("Firebase Auth is not initialized. Using default scenarios.");
+            setScenarios(DEFAULT_SCENARIOS);
+            setIsAuthReady(true);
+            return;
+        }
+        const unsubscribe = onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                setUserId(user.uid);
+            } else {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    try { await signInWithCustomToken(auth, __initial_auth_token); } 
+                    catch (e) { 
+                        console.error("Error signing in with custom token:", e);
+                        try { await signInAnonymously(auth); } catch (anonError) { console.error("Error signing in anonymously:", anonError); setError("Could not authenticate user."); }
+                    }
+                } else {
+                     try { await signInAnonymously(auth); } catch (anonError) { console.error("Error signing in anonymously:", anonError); setError("Could not authenticate user."); }
+                }
+            }
+            setIsAuthReady(true);
+        });
+        return () => unsubscribe();
+    }, []);
+
+    // Fetch scenarios from Firestore
+    useEffect(() => {
+        if (!db || !isAuthReady || !userId) {
+            if (!db) setScenarios(DEFAULT_SCENARIOS);
+            return;
+        }
+        const scenariosCollectionPath = `artifacts/${appId}/public/data/parentingScenarios`;
+        const q = query(collection(db, scenariosCollectionPath));
+        const unsubscribe = onSnapshot(q, async (querySnapshot) => {
+            if (!isAuthReady) return;
+            const scenariosData = [];
+            querySnapshot.forEach((doc) => { scenariosData.push({ id: doc.id, ...doc.data() }); });
+
+            if (scenariosData.length === 0) {
+                console.log("No scenarios in Firestore, adding defaults.");
+                setError('');
+                try {
+                    for (const scenario of DEFAULT_SCENARIOS) {
+                        const docRef = doc(db, scenariosCollectionPath, scenario.id || crypto.randomUUID());
+                        await setDoc(docRef, scenario);
+                    }
+                } catch (e) {
+                    console.error("Error adding default scenarios:", e);
+                    setError("Failed to initialize scenarios.");
+                    setScenarios(DEFAULT_SCENARIOS);
+                }
+            } else {
+                setScenarios(scenariosData);
+            }
+        }, (err) => {
+            console.error("Error fetching scenarios:", err);
+            setError("Could not load scenarios. Displaying defaults.");
+            setScenarios(DEFAULT_SCENARIOS);
+        });
+        return () => unsubscribe();
+    }, [isAuthReady, userId]);
+
+    const handleSelectScenario = (scenario) => {
+        setSelectedScenario(scenario);
+        setIsCustomScenarioMode(false);
+        setCustomScenarioInput('');
+        setUserResponse('');
+        setAiFeedback('');
+        setError('');
+        setShowInstructions(false);
+    };
+
+    const handleCustomScenarioSubmit = () => {
+        if (!customScenarioInput.trim()) {
+            setError("Please describe your custom scenario.");
+            return;
+        }
+        const customScenario = {
+            id: "custom_" + Date.now(),
+            title: `Custom: "${customScenarioInput.substring(0, 50)}${customScenarioInput.length > 50 ? '...' : ''}"`,
+            reactiveResponses: ["N/A for custom scenarios - focus on your response."],
+            modelResponses: [{ principle: "General Principles Apply", response: "Remember to acknowledge feelings, describe the problem, offer choices, etc." }],
+            promptContext: customScenarioInput,
+            isCustom: true
+        };
+        setSelectedScenario(customScenario);
+        setUserResponse('');
+        setAiFeedback('');
+        setError('');
+        setShowInstructions(false);
+    };
+
+    const getAIFeedback = async () => {
+        if (!userResponse.trim() || !selectedScenario) {
+            setError("Please select/define a scenario and write your response first.");
+            return;
+        }
+        setIsLoadingAiFeedback(true);
+        setAiFeedback('');
+        setError('');
+
+        const scenarioDescription = selectedScenario.isCustom ? selectedScenario.promptContext : selectedScenario.title;
+        const modelResponsesText = selectedScenario.isCustom ? 
+            "For this custom scenario, apply general 'How to Talk' principles like acknowledging feelings, describing the problem without blame, offering choices, and problem-solving together." :
+            selectedScenario.modelResponses.map(mr => `- "${mr.response}" (Principle: ${mr.principle})`).join('\n');
+        
+        const reactiveResponsesText = selectedScenario.isCustom ?
+            "N/A" :
+            selectedScenario.reactiveResponses.map(rr => `- "${rr}"`).join('\n');
+
+        const prompt = `
+        You are an AI assistant for parents, inspired by the book "How to Talk So Kids Will Listen & Listen So Kids Will Talk."
+        A parent is facing the following situation: "${scenarioDescription}".
+        The parent's attempted response is: "${userResponse}".
+
+        Based on the principles of validating feelings, naming emotions, offering choices, problem-solving together, describing without blaming, and using praise effectively, please provide feedback on the parent's response.
+        
+        Common pitfalls to avoid:
+        - Dismissing feelings, blaming, lecturing, threats, sarcasm.
+
+        Positive approaches to encourage:
+        - Acknowledging feelings, describing the problem, giving information, offering choices, I-messages, problem-solving.
+
+        Provide constructive feedback:
+        1. Acknowledge positive aspects of the parent's response.
+        2. Gently point out areas for improvement based on "How to Talk" principles.
+        3. Offer 1-2 specific alternative phrases or suggestions.
+        4. Keep the tone encouraging, supportive, and practical.
+        5. Format clearly.
+
+        Example model responses for this type of scenario (or general principles if custom):
+        ${modelResponsesText}
+        
+        Example reactive responses to avoid (if applicable):
+        ${reactiveResponsesText}
+
+        Now, provide feedback on the parent's attempt: "${userResponse}"
+        Feedback:
+        `;
+        
+        let chatHistory = [{ role: "user", parts: [{ text: prompt }] }];
+        const payload = { contents: chatHistory };
+        const apiKey = ""; 
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+        try {
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(`API request failed: ${errorData?.error?.message || response.status}`);
+            }
+            const result = await response.json();
+            if (result.candidates?.[0]?.content?.parts?.[0]?.text) {
+                setAiFeedback(result.candidates[0].content.parts[0].text);
+            } else {
+                throw new Error("Unexpected API response structure.");
+            }
+        } catch (e) {
+            console.error("Error getting AI feedback:", e);
+            setError(`Failed to get AI feedback: ${e.message}.`);
+            setAiFeedback("Sorry, I couldn't generate feedback due to an error.");
+        } finally {
+            setIsLoadingAiFeedback(false);
+        }
+    };
+    
+    const formatAIResponse = (text) => {
+        return text.split('\n').map((paragraph, index) => (
+            <p key={index} className="mb-2 last:mb-0 transition-opacity duration-500 ease-in-out">{paragraph}</p>
+        ));
+    };
+
+    if (!isAuthReady) {
+        return (
+            <div className="min-h-screen bg-gradient-to-br from-sky-100 via-rose-50 to-yellow-50 flex flex-col items-center justify-center p-4 text-slate-700 font-sans">
+                <Loader2 className="animate-spin h-16 w-16 text-sky-600" />
+                <p className="mt-6 text-xl font-semibold text-sky-700">Warming up the listening ears...</p>
+                {userId && <p className="text-sm text-slate-500 mt-2">User ID: {userId}</p>}
+            </div>
+        );
+    }
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-sky-100 via-rose-50 to-yellow-50 flex flex-col items-center p-4 sm:p-6 md:p-8 font-['Inter',_sans-serif] text-slate-800">
+            <header className="w-full max-w-5xl mb-8 md:mb-12 text-center">
+                <div className="inline-block p-2 bg-white rounded-full shadow-md mb-4">
+                    <MessageCircle className="h-10 w-10 sm:h-12 sm:w-12 text-sky-500" />
+                </div>
+                <h1 className="text-4xl sm:text-5xl font-bold text-sky-700 tracking-tight">
+                    Talk & Listen Trainer
+                </h1>
+                <p className="text-md text-slate-600 mt-2">Craft mindful responses, build stronger connections.</p>
+                {userId && <p className="text-xs text-slate-400 mt-2 opacity-75">User ID: {userId}</p>}
+            </header>
+
+            {error && (
+                <div className="w-full max-w-3xl bg-red-100 border-l-4 border-red-600 text-red-800 p-4 mb-6 rounded-lg shadow-lg" role="alert">
+                    <div className="flex">
+                        <div className="py-1"><AlertTriangle className="h-6 w-6 text-red-600 mr-3" /></div>
+                        <div>
+                            <p className="font-bold text-lg">Oops! A little hiccup.</p>
+                            <p className="text-sm">{error}</p>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {showInstructions && !selectedScenario && (
+                 <div className="w-full max-w-3xl bg-white/80 backdrop-blur-md border border-sky-200 p-6 mb-8 rounded-xl shadow-xl transform hover:scale-[1.01] transition-transform duration-300">
+                    <h2 className="text-2xl font-semibold text-sky-700 mb-4 flex items-center">
+                        <Sparkles className="h-7 w-7 mr-2 text-yellow-500" /> Welcome, Parent!
+                    </h2>
+                    <p className="text-slate-600 mb-3 text-lg">
+                        Ready to transform tricky moments into opportunities for connection?
+                    </p>
+                    <ol className="list-decimal list-inside text-slate-700 space-y-2 text-md">
+                        <li><strong>Pick a common scenario</strong> below, or create your own.</li>
+                        <li>See examples of what <strong className="text-red-600">not to say</strong> and <strong className="text-green-600">helpful alternatives</strong>.</li>
+                        <li>Type your response and get <strong className="text-sky-600">AI-powered feedback</strong>.</li>
+                    </ol>
+                    <p className="mt-5 text-md text-sky-700 font-medium">
+                        Let's practice together!
+                    </p>
+                </div>
+            )}
+
+            <div className="w-full max-w-5xl grid grid-cols-1 lg:grid-cols-3 gap-6 md:gap-8">
+                <div className="lg:col-span-1 bg-white/70 backdrop-blur-md p-5 sm:p-6 rounded-xl shadow-lg border border-slate-200/50">
+                    <h2 className="text-2xl font-semibold text-sky-600 mb-5 flex items-center">
+                        <List className="h-7 w-7 mr-2.5 text-sky-500" />
+                        Choose or Create
+                    </h2>
+                    
+                    <button
+                        onClick={() => { setIsCustomScenarioMode(!isCustomScenarioMode); setSelectedScenario(null); setCustomScenarioInput(''); setAiFeedback('');}}
+                        className={`w-full flex items-center justify-between text-left p-3.5 mb-3 rounded-lg transition-all duration-300 ease-in-out text-lg font-medium
+                            ${isCustomScenarioMode 
+                                ? 'bg-emerald-500 text-white shadow-md ring-2 ring-emerald-300 hover:bg-emerald-600' 
+                                : 'bg-emerald-100 hover:bg-emerald-200 text-emerald-800 focus:bg-emerald-200 ring-1 ring-emerald-300 hover:shadow-sm'}`}
+                    >
+                        {isCustomScenarioMode ? "Cancel Custom" : "Create Your Own Scenario"}
+                        {isCustomScenarioMode ? <Edit3 className="h-5 w-5 opacity-80" /> : <PlusCircle className="h-6 w-6 text-emerald-600" />}
+                    </button>
+
+                    {isCustomScenarioMode && (
+                        <div className="mb-4 p-4 bg-emerald-50 rounded-lg transition-all duration-500 ease-out transform opacity-0 animate-fadeInUp">
+                            <textarea
+                                value={customScenarioInput}
+                                onChange={(e) => setCustomScenarioInput(e.target.value)}
+                                placeholder="Describe your situation here..."
+                                className="w-full p-3 border border-emerald-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-shadow duration-150 resize-none shadow-sm"
+                                rows="4"
+                            />
+                            <button
+                                onClick={handleCustomScenarioSubmit}
+                                disabled={!customScenarioInput.trim()}
+                                className="mt-3 w-full flex items-center justify-center px-5 py-2.5 bg-emerald-600 text-white font-semibold rounded-lg hover:bg-emerald-700 focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:ring-offset-2 transition-all duration-200 disabled:opacity-60 disabled:cursor-not-allowed shadow hover:shadow-md transform hover:scale-[1.02]"
+                            >
+                                Use This Scenario <ArrowRight className="h-5 w-5 ml-2" />
+                            </button>
+                        </div>
+                    )}
+
+                    {!isCustomScenarioMode && (
+                        <ul className="space-y-2.5 max-h-[60vh] overflow-y-auto pr-1">
+                            {scenarios.length === 0 && !error && (
+                                <div className="flex items-center text-slate-500 p-3">
+                                    <Loader2 className="animate-spin h-5 w-5 mr-2.5" />
+                                    Loading scenarios...
+                                </div>
+                            )}
+                            {scenarios.map((scenario) => (
+                                <li key={scenario.id}>
+                                    <button
+                                        onClick={() => handleSelectScenario(scenario)}
+                                        className={`w-full text-left p-3.5 rounded-lg transition-all duration-200 ease-in-out transform hover:translate-x-1
+                                            ${selectedScenario?.id === scenario.id 
+                                                ? 'bg-sky-600 text-white shadow-lg ring-2 ring-sky-400 scale-105' 
+                                                : 'bg-sky-100 hover:bg-sky-200/70 text-sky-800 focus:bg-sky-200 ring-1 ring-sky-200 hover:shadow-md'}`}
+                                    >
+                                        {scenario.title}
+                                    </button>
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                </div>
+
+                <div className="lg:col-span-2 bg-white/70 backdrop-blur-md p-5 sm:p-7 rounded-xl shadow-xl border border-slate-200/50">
+                    {!selectedScenario ? (
+                        <div className="text-center text-slate-500 py-16 flex flex-col items-center justify-center h-full">
+                            <Zap className="h-16 w-16 mx-auto mb-6 text-slate-400/70" />
+                            <p className="text-2xl font-medium">Select or create a scenario to begin.</p>
+                            <p className="text-md mt-1">Your journey to mindful communication starts here.</p>
+                        </div>
+                    ) : (
+                        <div className="opacity-0 animate-fadeInUpDeluxe">
+                            <h2 className="text-3xl sm:text-4xl font-semibold text-transparent bg-clip-text bg-gradient-to-r from-emerald-500 to-teal-600 mb-3 leading-tight">{selectedScenario.title}</h2>
+                            
+                            {!selectedScenario.isCustom && (
+                                <>
+                                <div className="mb-6 p-4 bg-red-50/70 border border-red-200/80 rounded-lg shadow-sm">
+                                    <h3 className="text-lg font-semibold text-red-700 mb-2 flex items-center">
+                                        <AlertTriangle className="h-5 w-5 mr-2 text-red-500 shrink-0" />
+                                        Reactive Responses to Avoid
+                                    </h3>
+                                    <ul className="list-disc list-inside text-red-600/90 text-sm space-y-1 pl-1">
+                                        {selectedScenario.reactiveResponses.map((res, i) => <li key={i}>{res}</li>)}
+                                    </ul>
+                                </div>
+
+                                <div className="mb-6 p-4 bg-green-50/70 border border-green-200/80 rounded-lg shadow-sm">
+                                    <h3 className="text-lg font-semibold text-green-700 mb-2 flex items-center">
+                                        <CheckCircle2 className="h-5 w-5 mr-2 text-green-500 shrink-0" />
+                                        Model Responses (Examples)
+                                    </h3>
+                                    <ul className="space-y-2 pl-1">
+                                        {selectedScenario.modelResponses.map((res, i) => (
+                                            <li key={i} className="text-sm text-green-800/90">
+                                                <strong className="font-medium text-green-700">{res.principle}:</strong> "{res.response}"
+                                            </li>
+                                        ))}
+                                    </ul>
+                                </div>
+                                </>
+                            )}
+                             {selectedScenario.isCustom && (
+                                <div className="mb-6 p-4 bg-sky-50/70 border border-sky-200/80 rounded-lg shadow-sm">
+                                    <h3 className="text-lg font-semibold text-sky-700 mb-2 flex items-center">
+                                        <Brain className="h-5 w-5 mr-2 text-sky-500 shrink-0" />
+                                        Responding to Your Custom Scenario
+                                    </h3>
+                                    <p className="text-sm text-sky-600/90">
+                                        For your situation: "<em>{selectedScenario.promptContext}</em>", remember to apply core principles like acknowledging feelings, describing the problem without blame, offering choices, and problem-solving together. The AI will provide feedback based on these general strategies.
+                                    </p>
+                                </div>
+                            )}
+                            
+                            <div className="mt-8 pt-6 border-t border-slate-300/70">
+                                <h3 className="text-2xl font-semibold text-sky-700 mb-4 flex items-center">
+                                    <User className="h-7 w-7 mr-2.5 text-sky-600" />
+                                    Your Turn: How Would You Respond?
+                                </h3>
+                                <textarea
+                                    value={userResponse}
+                                    onChange={(e) => setUserResponse(e.target.value)}
+                                    placeholder="Type your thoughtful response here..."
+                                    className="w-full p-4 border border-slate-300 rounded-lg focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-all duration-150 resize-none shadow-sm text-md"
+                                    rows="5"
+                                />
+                                <button
+                                    onClick={getAIFeedback}
+                                    disabled={isLoadingAiFeedback || !userResponse.trim()}
+                                    className="mt-4 w-full sm:w-auto flex items-center justify-center px-8 py-3 bg-gradient-to-r from-sky-500 to-cyan-500 text-white font-semibold rounded-lg hover:from-sky-600 hover:to-cyan-600 focus:outline-none focus:ring-2 focus:ring-sky-400 focus:ring-offset-2 transition-all duration-200 disabled:opacity-60 disabled:cursor-not-allowed shadow-md hover:shadow-lg transform hover:scale-[1.03] text-lg"
+                                >
+                                    {isLoadingAiFeedback ? (
+                                        <>
+                                            <Loader2 className="animate-spin h-6 w-6 mr-2.5" />
+                                            Crafting Feedback...
+                                        </>
+                                    ) : (
+                                        <>
+                                            <Send className="h-5 w-5 mr-2.5" />
+                                            Get AI Feedback
+                                        </>
+                                    )}
+                                </button>
+                            </div>
+
+                            {aiFeedback && (
+                                <div className={`mt-8 p-5 bg-sky-50/80 border border-sky-200/80 rounded-lg shadow-md transition-all duration-500 ease-out transform opacity-0 ${aiFeedback ? 'animate-fadeInUp' : ''}`}>
+                                    <h3 className="text-xl font-semibold text-sky-700 mb-3 flex items-center">
+                                        <Brain className="h-6 w-6 mr-2.5 text-sky-600" />
+                                        AI-Powered Insights
+                                    </h3>
+                                    <div className="text-md text-slate-700 prose prose-sm max-w-none leading-relaxed">
+                                        {formatAIResponse(aiFeedback)}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
+            </div>
+            <footer className="w-full max-w-5xl mt-12 pt-8 border-t border-slate-300/50 text-center">
+                <p className="text-md text-slate-600">
+                    Inspired by "How to Talk So Kids Will Listen & Listen So Kids Will Talk".
+                </p>
+                <p className="text-sm text-slate-500/80 mt-1">
+                    Practice makes progress. For specific parenting advice, please consult with a qualified professional.
+                </p>
+            </footer>
+            <style>
+                {`
+                    @keyframes fadeInUp {
+                        from { opacity: 0; transform: translateY(20px); }
+                        to { opacity: 1; transform: translateY(0); }
+                    }
+                    .animate-fadeInUp { animation: fadeInUp 0.5s ease-out forwards; }
+
+                    @keyframes fadeInUpDeluxe {
+                        from { opacity: 0; transform: translateY(30px) scale(0.98); }
+                        to { opacity: 1; transform: translateY(0) scale(1); }
+                    }
+                    .animate-fadeInUpDeluxe { animation: fadeInUpDeluxe 0.6s cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards; }
+                    
+                    /* For Tailwind Prose customization if needed */
+                    .prose strong { color: inherit; } /* Example */
+                `}
+            </style>
+        </div>
+    );
